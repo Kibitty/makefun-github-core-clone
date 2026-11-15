@@ -390,6 +390,10 @@ export interface Issue {
   state: 'open' | 'closed'; labels: string[]; comments: Comment[];
   createdSeq: number; closedAt: string | null;
   author: string; authorId: number; createdAt: string; updatedAt: string; repo: string;
+  // Perf: cached serialized REST representation of this issue (single-issue GET).
+  // MUST be cleared at every Issue mutation site (REST PATCH, Store.addComment,
+  // GraphQL closeIssue) or a stale body will be served.
+  jsonCache?: { host: string; payload: Buffer };
 }
 export interface Label { name: string; color: string; description: string }
 export interface Pull {
@@ -410,6 +414,10 @@ export interface Repo {
   labels: Map<string, Label>;
   pulls: Map<number, Pull>; nextPull: number;
   nextCommentId: number;
+  // Perf: cache of complete upload-pack fetch responses (v0/v2), keyed by the
+  // full fetch request. The object graph is append-only, so a cached response
+  // for a given key stays correct forever; capped and size-limited (see gitproto.ts).
+  fetchCache?: Map<string, Buffer>;
 }
 
 export class Store {
@@ -812,6 +820,7 @@ export class Store {
     };
     issue.comments.push(comment);
     issue.updatedAt = this.trialNowIso;
+    issue.jsonCache = undefined;
     return comment;
   }
 

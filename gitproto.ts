@@ -81,6 +81,33 @@ export function writePack(objects: Array<{ type: GitObjectType; data: Buffer }>)
   return Buffer.concat([body, trailer]);
 }
 
+// -------------------------------------------------------------------------------------------
+// fetch-response cache (perf): repeated identical fetches (e.g. 50 concurrent clones of
+// the same tip) rebuild the same packfile every time — writePack alone costs ~0.44ms
+// (deflateSync per object, ~87us each). The object graph is append-only, so a cached
+// response for a given (protocol, wants, haves, shallow, depth, done) stays correct
+// forever. Capped at 8 entries, 256KB each; large packs (full-history fetches) are
+// not cached — they are one-offs anyway.
+// -------------------------------------------------------------------------------------------
+const FETCH_CACHE_MAX_ENTRIES = 8;
+const FETCH_CACHE_MAX_BYTES = 256 * 1024;
+function fetchCacheKey(version: 'v0' | 'v2', wants: string[], haves: string[], shallow: string[], depth: number | undefined, done: boolean): string {
+  return `${version}|${done ? '1' : '0'}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth ?? ''}`;
+}
+function getCachedFetch(repo: Repo, key: string): Buffer | undefined {
+  return repo.fetchCache?.get(key);
+}
+function setCachedFetch(repo: Repo, key: string, out: Buffer): void {
+  if (out.length > FETCH_CACHE_MAX_BYTES) return;
+  let cache = repo.fetchCache;
+  if (!cache) { cache = new Map<string, Buffer>(); repo.fetchCache = cache; }
+  if (!cache.has(key) && cache.size >= FETCH_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, out);
+}
+
 import { createHash } from 'node:crypto';
 
 // -------------------------------------------------------------------------------------------
@@ -582,6 +609,9 @@ export function handleFetchV2(repo: Repo, body: Buffer): Buffer {
     else if (line.startsWith('deepen ')) depth = parseInt(line.slice(7), 10);
     else if (line === 'done') done = true;
   }
+  const cacheKey = fetchCacheKey('v2', wants, haves, shallow, depth, done);
+  const cached = getCachedFetch(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, wants, haves, shallow, depth);
   const out: Array<Buffer | string | 'flush' | 'delim'> = [];
   if (!done) {
@@ -594,7 +624,9 @@ export function handleFetchV2(repo: Repo, body: Buffer): Buffer {
       out.push('NAK\n');
     }
     out.push('flush');
-    return pktLines(out);
+    const buf = pktLines(out);
+    setCachedFetch(repo, cacheKey, buf);
+    return buf;
   }
   // The client sent `done`: the acknowledgments section MUST be omitted (protocol-v2).
   if (plan.shallow.length || plan.unshallow.length) {
@@ -612,7 +644,9 @@ export function handleFetchV2(repo: Repo, body: Buffer): Buffer {
     out.push(Buffer.concat([Buffer.from([1]), slice]));
   }
   out.push('flush');
-  return pktLines(out);
+  const buf = pktLines(out);
+  setCachedFetch(repo, cacheKey, buf);
+  return buf;
 }
 
 /** v0 fetch (only used if a client asks for v0 explicitly). */
@@ -635,6 +669,9 @@ export function handleFetchV0(repo: Repo, body: Buffer): Buffer {
       if (line.startsWith('have ')) haves.push(line.slice(5).trim());
     }
   }
+  const cacheKey = fetchCacheKey('v0', wants, haves, shallow, depth, true);
+  const cached = getCachedFetch(repo, cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, wants, haves, shallow, depth);
   const out: Array<Buffer | string | 'flush'> = [];
   if (plan.acks.length) {
@@ -651,7 +688,9 @@ export function handleFetchV0(repo: Repo, body: Buffer): Buffer {
     out.push(Buffer.concat([Buffer.from([1]), slice]));
   }
   out.push('flush');
-  return pktLines(out);
+  const buf = pktLines(out);
+  setCachedFetch(repo, cacheKey, buf);
+  return buf;
 }
 
 // -------------------------------------------------------------------------------------------

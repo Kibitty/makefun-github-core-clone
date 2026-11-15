@@ -523,6 +523,7 @@ function executeDocument(store: Store, doc: ParsedDocument): { data: Record<stri
           issue.state = 'closed';
           issue.closedAt = store.nowIso();
           issue.updatedAt = store.nowIso();
+          issue.jsonCache = undefined;
           const issueField = f.children.find((c) => c.name === 'issue');
           data[key] = issueField ? { issue: resolveIssue(store, repo, issue, issueField.children, errors) } : null;
           break;

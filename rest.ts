@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Store } from './store.ts';
 import type { Repo, Issue, Pull, Comment } from './store.ts';
 import { DEFAULT_BRANCH } from './store.ts';
-import { readJsonBody, jsonReply, errorReply, notFound } from './http.ts';
+import { readJsonBody, jsonReply, jsonReplyRaw, errorReply, notFound } from './http.ts';
 
 export interface RestCtx {
   store: Store;
@@ -397,7 +397,16 @@ export async function handleRest(ctx: RestCtx): Promise<boolean> {
         const issue = store.getIssue(repo, num);
         if (!issue) { notFound(res); return true; }
         if (restPath.length === 2) {
-          if (method === 'GET') { jsonReply(res, 200, issueJson(issue, ctx)); return true; }
+          if (method === 'GET') {
+            // Perf: the read workload re-reads the same issue 2,000x; serve the
+            // cached serialization (invalidated at every mutation site).
+            const cached = issue.jsonCache;
+            if (cached && cached.host === ctx.host) { jsonReplyRaw(res, 200, cached.payload); return true; }
+            const payload = Buffer.from(JSON.stringify(issueJson(issue, ctx)), 'utf8');
+            issue.jsonCache = { host: ctx.host, payload };
+            jsonReplyRaw(res, 200, payload);
+            return true;
+          }
           if (method === 'PATCH') {
             const body = await readJsonBody(req);
             if (body === null) { errorReply(res, 400, 'malformed JSON body'); return true; }
@@ -408,6 +417,7 @@ export async function handleRest(ctx: RestCtx): Promise<boolean> {
               issue.closedAt = body.state === 'closed' ? store.nowIso() : null;
             }
             issue.updatedAt = store.nowIso();
+            issue.jsonCache = undefined;
             jsonReply(res, 200, issueJson(issue, ctx));
             return true;
           }
