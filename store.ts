@@ -55,7 +55,15 @@ export interface CommitView {
   tree: string; parents: string[]; author: string; committer: string; message: string;
 }
 
+// Commit objects are immutable once stored (append-only object graph), and every
+// parseCommit caller only reads .tree/.parents/.author/.committer/.message, so the
+// parsed view can be memoized per data Buffer. Keyed by object identity: callers
+// always pass the exact Buffer held in repo.objects.
+const commitViewCache = new WeakMap<Buffer, CommitView>();
+
 export function parseCommit(data: Buffer): CommitView {
+  const cached = commitViewCache.get(data);
+  if (cached !== undefined) return cached;
   const blank = data.indexOf('\n\n');
   const headerEnd = blank < 0 ? data.length : blank;
   const message = blank < 0 ? '' : data.subarray(blank + 2).toString('utf8');
@@ -73,7 +81,9 @@ export function parseCommit(data: Buffer): CommitView {
     else if (key === 'author') author = val;
     else if (key === 'committer') committer = val;
   }
-  return { tree, parents, author, committer, message };
+  const view: CommitView = { tree, parents, author, committer, message };
+  commitViewCache.set(data, view);
+  return view;
 }
 
 export function buildCommit(o: {
@@ -418,6 +428,18 @@ export interface Repo {
   // full fetch request. The object graph is append-only, so a cached response
   // for a given key stays correct forever; capped and size-limited (see gitproto.ts).
   fetchCache?: Map<string, Buffer>;
+  // Perf: 1-entry fast path in front of fetchCache — the raw request bytes are
+  // the key, so a repeat identical fetch skips pkt-line decoding entirely.
+  // Same soundness as fetchCache: the response is a pure function of the request
+  // over an append-only graph (new objects are descendants, never ancestors of
+  // the wants, so reachability from old wants is unchanged).
+  lastFetchBody?: string;
+  lastFetchOut?: Buffer;
+  // Perf: ls-refs response cache, keyed by raw request bytes. MUST be cleared at
+  // every ref mutation site (receive-pack, commitFile, createRef, squashMerge)
+  // or ls-refs will serve stale refs. Peel targets are immutable, so ref changes
+  // are the only invalidation trigger.
+  lsRefsCache?: Map<string, Buffer>;
 }
 
 export class Store {
@@ -431,6 +453,7 @@ export class Store {
   readonly viewer: ScenarioUser;
   readonly stranger: ScenarioUser;
   readonly token: string;
+  readonly authHeader: string; // precomputed `Bearer <token>` (per-request template alloc avoided)
   readonly trialNowSec: number;
   readonly trialNowIso: string;
 
@@ -439,6 +462,7 @@ export class Store {
     this.viewer = users[0]!;
     this.stranger = users[2]!;
     this.token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+    this.authHeader = this.token === '' ? '' : `Bearer ${this.token}`;
     const nowRaw = process.env.MAKEFUN_TRIAL_NOW ?? '';
     const parsed = nowRaw === '' ? NaN : Date.parse(nowRaw) / 1000;
     this.trialNowSec = Number.isFinite(parsed) ? Math.floor(parsed) : 1700000000;
@@ -536,6 +560,7 @@ export class Store {
     });
     const commitOid = this.putObject(repo, 'commit', commitData);
     repo.refs.set(`refs/heads/${branch}`, commitOid);
+    repo.lsRefsCache = undefined; // ref changed: ls-refs cache is stale
     return commitOid;
   }
 
@@ -604,6 +629,7 @@ export class Store {
     if (repo.refs.has(ref)) return false;
     if (!repo.objects.has(sha)) return false;
     repo.refs.set(ref, sha);
+    repo.lsRefsCache = undefined; // ref changed: ls-refs cache is stale
     return true;
   }
 
@@ -645,6 +671,7 @@ export class Store {
     });
     const commitOid = this.putObject(repo, 'commit', commitData);
     repo.refs.set(`refs/heads/${pr.baseRef}`, commitOid);
+    repo.lsRefsCache = undefined; // ref changed: ls-refs cache is stale
     return commitOid;
   }
 

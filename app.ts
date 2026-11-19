@@ -13,8 +13,7 @@ import {
 
 function isAuthorized(store: Store, req: IncomingMessage): boolean {
   if (store.token === '') return true; // no token configured (local dev only)
-  const header = req.headers.authorization;
-  return header === `Bearer ${store.token}`;
+  return req.headers.authorization === store.authHeader;
 }
 
 function unauthorized(res: ServerResponse): void {
@@ -58,7 +57,9 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
     requestIdFor(store, res);
     if (!isAuthorized(store, req)) { unauthorized(res); return; }
     const host = req.headers.host ?? 'localhost';
-    const ctx: RestCtx = { store, viewer: store.viewerLogin(), req, res, host };
+    // Perf: the URL is already parsed above; pass it down instead of re-parsing
+    // it in handleRest (the read workload does 2,000 REST GETs per round).
+    const ctx: RestCtx = { store, viewer: store.viewerLogin(), req, res, host, url };
     await handleRest(ctx);
     return;
   }

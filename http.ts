@@ -30,6 +30,7 @@ export async function readRawBody(req: IncomingMessage, cap = 50 * 1024 * 1024):
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let count = 0;
     let settled = false;
     const finish = (result: Buffer | null): void => {
       if (settled) return;
@@ -44,8 +45,9 @@ export async function readRawBody(req: IncomingMessage, cap = 50 * 1024 * 1024):
       total += b.length;
       if (total > cap) { finish(null); return; }
       chunks.push(b);
+      count += 1;
     };
-    const onEnd = (): void => finish(Buffer.concat(chunks));
+    const onEnd = (): void => finish(count === 1 ? chunks[0]! : Buffer.concat(chunks));
     const onError = (): void => finish(null);
     req.on('data', onData);
     req.on('end', onEnd);

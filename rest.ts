@@ -11,6 +11,7 @@ export interface RestCtx {
   req: IncomingMessage;
   res: ServerResponse;
   host: string;
+  url: URL; // parsed once in app.ts handleRequest; do not re-parse per handler
 }
 
 const INSTALLED_VERSION = '1.0.0-github-core-clone';
@@ -154,8 +155,7 @@ function paginate<T>(items: T[], page: number, perPage: number): T[] {
 // Route handler: returns true when handled.
 // -------------------------------------------------------------------------------------------
 export async function handleRest(ctx: RestCtx): Promise<boolean> {
-  const { req, res, store } = ctx;
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+  const { req, res, store, url } = ctx;
   const path = url.pathname;
   const q = url.searchParams;
   const method = req.method ?? 'GET';

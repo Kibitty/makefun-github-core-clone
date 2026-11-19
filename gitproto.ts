@@ -500,18 +500,24 @@ function refPeel(repo: Repo, oid: string): string | undefined {
   return peelToCommit(oid, (o) => repo.objects.get(o));
 }
 
-/** v2 capability advertisement for upload-pack. */
+/** v2 capability advertisement for upload-pack. Fully constant (no repo data),
+ * so the serialized form is built once and reused. The returned Buffer is never
+ * mutated by callers (res.end only reads it). */
+let v2AdvertCache: Buffer | undefined;
 export function advertiseV2UploadPack(repo: Repo): Buffer {
-  return pktLines([
-    '# service=git-upload-pack\n',
-    'flush',
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done\n',
-    'object-format=sha1\n',
-    'agent\n',
-    'flush',
-  ]);
+  if (v2AdvertCache === undefined) {
+    v2AdvertCache = pktLines([
+      '# service=git-upload-pack\n',
+      'flush',
+      'version 2\n',
+      'ls-refs=unborn\n',
+      'fetch=shallow wait-for-done\n',
+      'object-format=sha1\n',
+      'agent\n',
+      'flush',
+    ]);
+  }
+  return v2AdvertCache;
 }
 
 /** v0 advertisement (upload-pack when the client did not ask for v2, receive-pack always). */
@@ -546,7 +552,26 @@ export function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receiv
 // -------------------------------------------------------------------------------------------
 // ls-refs (v2)
 // -------------------------------------------------------------------------------------------
+const LSREFS_CACHE_MAX_ENTRIES = 8;
 export function handleLsRefs(repo: Repo, body: Buffer): Buffer {
+  // Fast path: the 50 concurrent clones send byte-identical ls-refs requests.
+  // latin1 is a 1:1 byte->char mapping, so the string IS the request bytes.
+  // Invalidated on every ref change (see store.ts / handleReceivePack).
+  const rawKey = body.toString('latin1');
+  const hit = repo.lsRefsCache?.get(rawKey);
+  if (hit !== undefined) return hit;
+  const out = handleLsRefsUncached(repo, body);
+  let cache = repo.lsRefsCache;
+  if (!cache) { cache = new Map<string, Buffer>(); repo.lsRefsCache = cache; }
+  if (!cache.has(rawKey) && cache.size >= LSREFS_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(rawKey, out);
+  return out;
+}
+
+function handleLsRefsUncached(repo: Repo, body: Buffer): Buffer {
   const packets = decodePktLines(body);
   let peel = false;
   let symrefs = false;
@@ -591,6 +616,13 @@ export function handleLsRefs(repo: Repo, body: Buffer): Buffer {
 // fetch (v2)
 // -------------------------------------------------------------------------------------------
 export function handleFetchV2(repo: Repo, body: Buffer): Buffer {
+  // Fast path: the 50 concurrent clones send byte-identical fetch requests.
+  // latin1 is a 1:1 byte->char mapping, so the string IS the request bytes —
+  // this skips pkt-line decoding entirely on a repeat. Same soundness as
+  // fetchCache (see the Repo field comment): the response is a pure function
+  // of the request over an append-only graph.
+  const rawKey = body.toString('latin1');
+  if (repo.lastFetchBody === rawKey && repo.lastFetchOut !== undefined) return repo.lastFetchOut;
   const packets = decodePktLines(body);
   const wants: string[] = [];
   const haves: string[] = [];
@@ -626,6 +658,8 @@ export function handleFetchV2(repo: Repo, body: Buffer): Buffer {
     out.push('flush');
     const buf = pktLines(out);
     setCachedFetch(repo, cacheKey, buf);
+    repo.lastFetchBody = rawKey;
+    repo.lastFetchOut = buf;
     return buf;
   }
   // The client sent `done`: the acknowledgments section MUST be omitted (protocol-v2).
@@ -646,11 +680,15 @@ export function handleFetchV2(repo: Repo, body: Buffer): Buffer {
   out.push('flush');
   const buf = pktLines(out);
   setCachedFetch(repo, cacheKey, buf);
+  repo.lastFetchBody = rawKey;
+  repo.lastFetchOut = buf;
   return buf;
 }
 
 /** v0 fetch (only used if a client asks for v0 explicitly). */
 export function handleFetchV0(repo: Repo, body: Buffer): Buffer {
+  const rawKey = body.toString('latin1');
+  if (repo.lastFetchBody === rawKey && repo.lastFetchOut !== undefined) return repo.lastFetchOut;
   const packets = decodePktLines(body);
   const wants: string[] = [];
   const haves: string[] = [];
@@ -690,6 +728,8 @@ export function handleFetchV0(repo: Repo, body: Buffer): Buffer {
   out.push('flush');
   const buf = pktLines(out);
   setCachedFetch(repo, cacheKey, buf);
+  repo.lastFetchBody = rawKey;
+  repo.lastFetchOut = buf;
   return buf;
 }
 
@@ -752,6 +792,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
         lines.push({ ref: cmd.ref, ok: false, reason: 'old ref value does not match' });
       } else {
         repo.refs.delete(cmd.ref);
+        repo.lsRefsCache = undefined; // ref changed: ls-refs cache is stale
         lines.push({ ref: cmd.ref, ok: true, reason: '' });
       }
       continue;
@@ -767,6 +808,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
         continue;
       }
       repo.refs.set(cmd.ref, cmd.newOid);
+      repo.lsRefsCache = undefined; // ref changed: ls-refs cache is stale
       lines.push({ ref: cmd.ref, ok: true, reason: '' });
       continue;
     }
@@ -789,6 +831,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
       continue;
     }
     repo.refs.set(cmd.ref, cmd.newOid);
+    repo.lsRefsCache = undefined; // ref changed: ls-refs cache is stale
     lines.push({ ref: cmd.ref, ok: true, reason: '' });
   }
   const inner: string[] = [];
