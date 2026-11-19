@@ -1,5 +1,9 @@
 # github-core-clone-01 — GitHub-compatible git forge
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Kibitty/makefun-github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Kibitty/makefun-github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A standalone, one-process GitHub-compatible git forge in Node 22, stdlib only, no
 dependencies, no git binary, no model calls. Built for
 [the contest](https://make.fun/bounty/github-core-clone-01) ($500, entries close
@@ -28,13 +32,13 @@ auth and ownership match the trial fixture. All state is deterministic from
 node --experimental-strip-types main.ts
 ```
 
-`main.ts` (unchanged starter lifecycle): bind an ephemeral port, POST
+`main.ts` (entrypoint lifecycle, rewritten in-session for v3): bind an ephemeral port, POST
 `{"port": N}` to `$MAKEFUN_ENV_URL/register`, poll `$MAKEFUN_ENV_URL/done`,
 exit 0 when done.
 
 ## Layout
 
-- `main.ts` — lifecycle (unchanged from starter)
+- `main.ts` — lifecycle (rewritten in-session for v3, behaviour identical)
 - `app.ts` — HTTP server + routing + auth + request-id
 - `store.ts` — in-memory store, git object model, scenario PRNG, issues/PRs/labels
 - `gitproto.ts` — pkt-lines, pack reader/writer, fetch planning, upload/receive-pack
