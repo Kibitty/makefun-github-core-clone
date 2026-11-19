@@ -1,103 +1,135 @@
-// Trial lifecycle for the forge entry point. The suite grades the server
-// built by app.ts; this file only runs the handshake with the trial env:
-// bind a port, register it, then wait until the env says the trial is done.
-// It must not exit early, and it must not bind 8080, which the env owns.
+// Forge entry point: lifecycle only, no graded behaviour lives here.
+//
+// app.ts implements the GitHub-compatible server that the trial grades.
+// This file performs the harness handshake around it:
+//   1. bind the server to an ephemeral port (never 8080 — the harness owns it),
+//   2. POST the port to the harness /register endpoint,
+//   3. poll the harness /done endpoint until the trial is over, then shut down.
+// The process must stay alive for the whole trial and exit 0 only after
+// the harness says done.
 
 import { createApp } from './app.ts';
 
-const envOrigin = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (envOrigin === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
-  process.exit(1);
+// Harness base URL, taken from the environment and normalised once.
+const harnessUrl = (() => {
+  const value = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+  if (value === '') {
+    process.stderr.write('[entry] MAKEFUN_ENV_URL is unset, nothing to register with\n');
+    process.exit(1);
+  }
+  return value;
+})();
+
+// Retry timing for harness calls: exponential waits, capped, with a
+// fixed per-request timeout so a hung harness call cannot stall us.
+const RETRY = {
+  perRequestMs: 30_000,
+  startMs: 250,
+  ceilingMs: 2_000,
+  doublings: 8,
+} as const;
+
+const pause = (ms: number): Promise<void> =>
+  new Promise((wake) => setTimeout(wake, ms));
+
+function delayFor(attempt: number): number {
+  const steps = Math.min(attempt, RETRY.doublings);
+  return Math.min(RETRY.ceilingMs, RETRY.startMs * 2 ** steps);
 }
 
-const REQUEST_TIMEOUT_MS = 30_000;
-const BACKOFF_FIRST_MS = 250;
-const BACKOFF_LIMIT_MS = 2_000;
-const BACKOFF_DOUBLINGS = 8;
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-function backoffMs(failures: number): number {
-  const doublings = Math.min(failures, BACKOFF_DOUBLINGS);
-  return Math.min(BACKOFF_LIMIT_MS, BACKOFF_FIRST_MS * 2 ** doublings);
+// One fetch against the harness, always bounded by the per-request
+// timeout so a hung harness call cannot stall the retry loop.
+function harnessFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${harnessUrl}${path}`, {
+    ...init,
+    signal: AbortSignal.timeout(RETRY.perRequestMs),
+  });
 }
 
-// Keep calling `probe` until it reports true. A probe that throws is a
-// retryable failure, unless it throws the fatal contract error from
-// register, which is rethrown to end the program.
-async function pollUntilTrue(probe: () => Promise<boolean>): Promise<void> {
-  let failures = 0;
+// Marker prefix on the error registerPort() throws for a contract rejection
+// (HTTP 400/405). repeatUntil treats that as fatal and stops retrying.
+const REJECTED_PREFIX = 'registration rejected: HTTP ';
+
+// Call `check` again and again until it resolves true. A throwing check
+// is retried like a false one, except a registration rejection, which
+// aborts the process by propagating out.
+async function repeatUntil(check: () => Promise<boolean>): Promise<void> {
+  let attempts = 0;
   for (;;) {
     try {
-      if (await probe()) return;
+      if (await check()) return;
     } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      const rejected = err instanceof Error && err.message.startsWith(REJECTED_PREFIX);
+      if (rejected) throw err;
     }
-    await sleep(backoffMs(failures));
-    failures += 1;
+    await pause(delayFor(attempts));
+    attempts += 1;
   }
 }
 
-// Tell the env which port the forge listens on. 200 registers it; 409 means
-// another entry registered first and this one just waits. 400/405 are
-// contract errors and end the program; anything else is retried.
-async function register(port: number): Promise<void> {
-  await pollUntilTrue(async () => {
-    const response = await fetch(`${envOrigin}/register`, {
+// Register this forge's port with the harness. HTTP 200 means registered;
+// 409 means another entry got there first and we simply wait alongside
+// it. 400/405 mean our request broke the contract — fatal. Anything else
+// (5xx, network error, timeout) is retried by repeatUntil.
+async function registerPort(port: number): Promise<void> {
+  await repeatUntil(async () => {
+    const res = await harnessFetch('/register', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ port }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-    const status = response.status;
-    if (status === 200 || status === 409) return true;
-    if (status === 400 || status === 405) {
-      throw new Error(`register answered HTTP ${status}: ${await response.text()}`);
+    const code = res.status;
+    if (code === 200 || code === 409) return true;
+    if (code === 400 || code === 405) {
+      const detail = await res.text();
+      throw new Error(`${REJECTED_PREFIX}${code}: ${detail}`);
     }
     return false;
   });
 }
 
-// Poll GET /done until it answers {"done": true}; never return before that.
-async function waitForDone(): Promise<void> {
-  await pollUntilTrue(async () => {
-    const response = await fetch(`${envOrigin}/done`, {
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    if (!response.ok) return false;
-    const body = (await response.json()) as { done?: unknown };
-    return body.done === true;
+// Keep asking the harness whether the trial finished; resolve only once
+// it answers {"done": true}. A non-OK answer just means "not yet".
+async function waitForFinish(): Promise<void> {
+  await repeatUntil(async () => {
+    const res = await harnessFetch('/done');
+    if (!res.ok) return false;
+    const payload = (await res.json()) as { done?: unknown };
+    return payload.done === true;
   });
 }
 
-async function main(): Promise<void> {
-  const server = createApp();
-  const port = await new Promise<number>((resolve, reject) => {
+// Bind the server to a free ephemeral port and report which one it got.
+function bindEphemeral(server: ReturnType<typeof createApp>): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => {
-      const bound = server.address();
-      if (bound === null || typeof bound === 'string') {
-        reject(new Error('the server did not bind an ephemeral TCP port'));
+      const addr = server.address();
+      if (addr === null || typeof addr === 'string') {
+        reject(new Error('server failed to bind an ephemeral TCP port'));
         return;
       }
-      resolve(bound.port);
+      resolve(addr.port);
     });
   });
-  process.stdout.write(`[entry] listening on port ${port}\n`);
-  await register(port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-  await waitForDone();
-  server.close();
-  process.stdout.write('[entry] done\n');
 }
 
-try {
-  await main();
-  process.exit(0);
-} catch (err) {
-  const message = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`[entry] ${message}\n`);
-  process.exit(1);
+async function boot(): Promise<void> {
+  const server = createApp();
+  const port = await bindEphemeral(server);
+  process.stdout.write(`[entry] forge listening on ${port}\n`);
+  await registerPort(port);
+  process.stdout.write('[entry] registered with harness, waiting for trial to finish\n');
+  await waitForFinish();
+  server.close();
+  process.stdout.write('[entry] trial finished, shutting down\n');
 }
+
+boot().then(
+  () => process.exit(0),
+  (err: unknown) => {
+    const text = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[entry] ${text}\n`);
+    process.exit(1);
+  },
+);
